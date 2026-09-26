@@ -5,10 +5,12 @@
 # Keeps local fixes to WeatherFlow PiConsole applied, including
 # after `wfpiconsole update`, which restores the stock files.
 #
-#   1. square dials      kvlang/layout.kv
-#   2. udp obs length    lib/observation_parser.py
+#   1. square dials       kvlang/layout.kv
+#   2. udp obs length     lib/observation_parser.py
+#   3. sager metar clouds lib/sager.py
+#   4. display precision  lib/observation_format.py
 #
-# Both are described in the patch script itself.
+# All four are described in the patch script itself.
 #
 # Installs:
 #   /usr/local/bin/wfpiconsole-patches        the idempotent fixes
@@ -88,6 +90,33 @@ never fails in a way that would stop the console from starting.
      rain_accumulation() builds today's total from the REST API
      plus each minute's rain and ignores that field.
      Upstream: issues #173 and #177.
+
+  3. SAGER METAR CLOUDS (lib/sager.py)
+     The Sager forecaster asks CheckWX for decoded METARs within
+     100 miles and keeps the nearest report that has a 'clouds'
+     key. A clear-sky report - SKC, CLR, CAVOK, NCD, NSC - has no
+     cloud layers to decode, so CheckWX omits that key entirely
+     and every such report is discarded. With only one station in
+     range, as on the CheckWX free tier, the forecast then fails
+     with "Missing METAR cloud information" on exactly the days
+     the sky is clearest. get_dial_setting() searches raw_text for
+     cloud codes anyway and handles the clear ones explicitly, so
+     nothing downstream needs the decoded list. Fix: fall back to
+     the nearest report whose raw_text carries a recognised cloud
+     group.
+
+  4. DISPLAY PRECISION (lib/observation_format.py)
+     Two values are shown to more decimals than the instrument can
+     resolve. Temperature prints as 72.1 F, but the Tempest is
+     spec'd at +/-0.3 C (+/-0.5 F), so the tenth is noise wearing
+     the costume of precision - integers. Pressure prints as
+     29.921 inHg, a resolution of about 0.03 hPa against a +/-1
+     hPa sensor, and two decimals is how everyone reads an
+     altimeter setting anyway.
+
+     Both rate-of-change figures keep their decimals: a trend of a
+     few tenths of a degree, or a few thousandths of an inch, per
+     hour IS the signal, and rounding it would flatten it to zero.
 """
 import os
 import re
@@ -138,6 +167,92 @@ UDP_PATCHED = """        # UDP obs_st carries 18 fields (0-17). Indices 18-21 ex
 UDP_DONE = "def _field(index):"
 
 
+# ---- 3. Sager METAR clouds ------------------------------------------
+SAGER_ORIGINAL = """            self.sager_data['METAR'] = None
+            for METAR in METAR_data:
+                if 'clouds' in METAR:
+                    self.sager_data['METAR'] = METAR['raw_text']
+                    break
+"""
+SAGER_PATCHED = """            # A clear-sky report - SKC, CLR, CAVOK, NCD, NSC - has no
+            # decoded 'clouds' list, so requiring that key throws away
+            # a perfectly usable report and the forecast fails with
+            # "Missing METAR cloud information" on every clear day.
+            # get_dial_setting() reads cloud cover out of raw_text
+            # anyway, and handles the clear codes explicitly, so take
+            # the nearest report whose raw_text carries any recognised
+            # cloud group - preferring a decoded one when there is
+            # both.
+            _ccodes = ('CAVOK', 'CLR', 'NCD', 'NSC', 'SKC',
+                       'FEW', 'SCT', 'BKN', 'OVC', 'VV')
+            self.sager_data['METAR'] = None
+            for METAR in METAR_data:
+                if METAR.get('clouds'):
+                    self.sager_data['METAR'] = METAR['raw_text']
+                    break
+            if self.sager_data['METAR'] is None:
+                for METAR in METAR_data:
+                    raw = METAR.get('raw_text') or ''
+                    if any(code in raw for code in _ccodes):
+                        self.sager_data['METAR'] = raw
+                        break
+"""
+SAGER_DONE = "_ccodes = ('CAVOK', 'CLR', 'NCD', 'NSC', 'SKC',"
+
+
+# ---- 4. display precision -------------------------------------------
+# Temperature to whole degrees. The trailing "if T.strip() == 'c':"
+# pins this to the temperature branch and away from the identical
+# looking rate-of-change branch just below it.
+TEMP_ORIGINAL = """                    elif round(cObs[ii - 1], 1) == 0.0:
+                        cObs[ii - 1] = '{:.1f}'.format(abs(cObs[ii - 1]))
+                    else:
+                        cObs[ii - 1] = '{:.1f}'.format(cObs[ii - 1])
+                    if T.strip() == 'c':
+"""
+TEMP_PATCHED = """                    elif round(cObs[ii - 1], 0) == 0.0:
+                        cObs[ii - 1] = '{:.0f}'.format(abs(cObs[ii - 1]))
+                    else:
+                        cObs[ii - 1] = '{:.0f}'.format(cObs[ii - 1])
+                    if T.strip() == 'c':
+"""
+TEMP_DONE = """                        cObs[ii - 1] = '{:.0f}'.format(cObs[ii - 1])
+                    if T.strip() == 'c':
+"""
+
+# Pressure in inHg to two decimals, splitting it from the hourly
+# trend, which the original formats on the same branch.
+PRES_ORIGINAL = """                        if P.strip() in ['inHg/hr', 'inHg']:
+                            if round(cObs[ii - 1], 3) == 0.0:
+                                cObs[ii - 1] = '{:.3f}'.format(abs(cObs[ii - 1]))
+                            else:
+                                cObs[ii - 1] = '{:.3f}'.format(cObs[ii - 1])
+"""
+PRES_PATCHED = """                        if P.strip() == 'inHg':
+                            if round(cObs[ii - 1], 2) == 0.0:
+                                cObs[ii - 1] = '{:.2f}'.format(abs(cObs[ii - 1]))
+                            else:
+                                cObs[ii - 1] = '{:.2f}'.format(cObs[ii - 1])
+                        elif P.strip() == 'inHg/hr':
+                            if round(cObs[ii - 1], 3) == 0.0:
+                                cObs[ii - 1] = '{:.3f}'.format(abs(cObs[ii - 1]))
+                            else:
+                                cObs[ii - 1] = '{:.3f}'.format(cObs[ii - 1])
+"""
+PRES_DONE = "if P.strip() == 'inHg':"
+
+
+def precision_patch(text):
+    count = 0
+    for original, patched in ((TEMP_ORIGINAL, TEMP_PATCHED),
+                              (PRES_ORIGINAL, PRES_PATCHED)):
+        n = text.count(original)
+        if n:
+            text = text.replace(original, patched)
+            count += n
+    return text, count
+
+
 def apply(name, path, change, done_marker):
     """Apply one patch. Returns a short status line."""
     try:
@@ -165,6 +280,14 @@ status = [
           os.path.join(ROOT, 'lib', 'observation_parser.py'),
           lambda t: (t.replace(UDP_ORIGINAL, UDP_PATCHED), t.count(UDP_ORIGINAL)),
           lambda t: UDP_DONE in t),
+    apply("sager-metar-clouds",
+          os.path.join(ROOT, 'lib', 'sager.py'),
+          lambda t: (t.replace(SAGER_ORIGINAL, SAGER_PATCHED), t.count(SAGER_ORIGINAL)),
+          lambda t: SAGER_DONE in t),
+    apply("display-precision",
+          os.path.join(ROOT, 'lib', 'observation_format.py'),
+          precision_patch,
+          lambda t: TEMP_DONE in t and PRES_DONE in t),
 ]
 for line in status:
     print(line)
@@ -190,6 +313,8 @@ Description=Watch PiConsole files and re-apply local patches when they change
 [Path]
 PathChanged=$WFPC/kvlang/layout.kv
 PathChanged=$WFPC/lib/observation_parser.py
+PathChanged=$WFPC/lib/sager.py
+PathChanged=$WFPC/lib/observation_format.py
 Unit=wfpiconsole-patches.service
 
 [Install]
