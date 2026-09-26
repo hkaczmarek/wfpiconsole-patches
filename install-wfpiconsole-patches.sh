@@ -11,6 +11,8 @@
 #   pressure-precision  lib/observation_format.py
 #   temp-whole-degrees  lib/observation_format.py   (off by default)
 #   temp-decimal-size   kvlang/temperature.kv
+#   peak-sun-precision  lib/observation_format.py
+#   panel-accents       kvlang/*.kv
 #
 # Each is described in the patch script itself.
 #
@@ -157,6 +159,22 @@ update` restores stock in that case.
      difference or the trend - those are rates, already drawn
      small, and there the decimal IS the signal.
 
+     temp-unit-superscript, also in the conf file, additionally
+     draws the unit small and raised on the four plain fields -
+     Kivy's [sup], which is the one place that tag is the right
+     tool, since it positions at the top of the line rather than on
+     the baseline. The min/max units are left alone: they are
+     already reduced to 0.83 and raising them too reads as noise.
+
+     temp-colour, also in the conf file, tints each reading by its
+     own value, using the two accents the console already carries -
+     00a4b4 for a minimum, f05e40 for a maximum - with ordinary grey
+     in the middle, so a mild reading looks unchanged. Dew point
+     gets its own scale, since it says more about comfort than
+     humidity does. The min/max fields are left out: they use
+     colour already, to say which is which. Stops are in displayed
+     units, Fahrenheit on this build.
+
      Size, and height, are set by temp-decimal-scale in the conf
      file. Kivy offers inline text three vertical positions -
      superscript, normal, subscript - and no pixel offset, so on
@@ -164,6 +182,19 @@ update` restores stock in that case.
      (line_height - word_height) / 1.25. A larger span therefore
      sits higher, which makes the scale the only fine adjustment
      available for height as well as size.
+  peak-sun-precision (lib/observation_format.py)
+     Peak Sun Hours prints as 0.00 hrs. Two decimals on a figure in
+     hours is more than the number carries; one is plenty. The
+     battery voltage line looks identical and is left alone - two
+     decimals across a 2.4-2.8 V range is right there.
+
+  panel-accents (kvlang/*.kv)
+     Every panel heading is drawn white. Colouring them per panel is
+     most of what gives the Ambient WS-2902 console its liveliness.
+     PanelTitle inherits markup from DisplayField, so wrapping the
+     title string in a [color] tag is enough - no widget changes.
+     Spans nine titles across seven files. Colours are set in the
+     conf file.
 """
 import os
 import re
@@ -182,13 +213,23 @@ DEFAULTS = {
     'pressure-precision': True,
     'temp-whole-degrees': False,
     'temp-decimal-size':  True,
+    'peak-sun-precision': True,
+    'panel-accents':      True,
 }
 
 
 def settings():
-    """Read the conf file. Returns (on/off per patch, decimal scale)."""
+    """Read the conf file. Returns patches plus the five decimal settings."""
     state = dict(DEFAULTS)
     scale = DEC_SCALE_DEFAULT
+    sup   = DEC_SUP_DEFAULT
+    usc   = DEC_UNIT_SCALE_DEFAULT
+    pos   = DEC_POS_DEFAULT
+    umin  = DEC_UNIT_MIN_DEFAULT
+    tint  = TEMP_COLOUR_DEFAULT
+    phue  = dict(PANEL_HUES_DEFAULT)
+    tstop, thue = list(TEMP_STOPS_DEFAULT), list(TEMP_HUES_DEFAULT)
+    dstop, dhue = list(DEW_STOPS_DEFAULT),  list(DEW_HUES_DEFAULT)
     try:
         with open(CONF) as f:
             for line in f:
@@ -204,9 +245,53 @@ def settings():
                         scale = round(min(max(float(value), 0.3), 1.0), 3)
                     except ValueError:
                         pass
+                elif key == 'temp-unit-superscript':
+                    sup = value.lower() in ('on', 'true', 'yes', '1')
+                elif key == 'temp-unit-scale':
+                    try:
+                        usc = round(min(max(float(value), 0.2), 1.0), 3)
+                    except ValueError:
+                        pass
+                elif key == 'temp-decimal-position':
+                    if value.lower() in DEC_POS_TAGS:
+                        pos = value.lower()
+                elif key == 'temp-unit-min-px':
+                    try:
+                        umin = min(max(int(value), 4), 40)
+                    except ValueError:
+                        pass
+                elif key == 'temp-colour':
+                    tint = value.lower() in ('on', 'true', 'yes', '1')
+                elif key == 'temp-colour-stops':
+                    tstop = parse_stops(value, tstop)
+                elif key == 'temp-colour-values':
+                    thue = parse_hues(value, thue)
+                elif key == 'dewpoint-colour-stops':
+                    dstop = parse_stops(value, dstop)
+                elif key == 'dewpoint-colour-values':
+                    dhue = parse_hues(value, dhue)
+                elif key == 'panel-accent-colours':
+                    # "Temperature: f0a050, Rainfall: 4fc3d7" - only the
+                    # panels named are changed, the rest keep the default.
+                    for item in value.split(','):
+                        if ':' not in item:
+                            continue
+                        panel, _, hue = item.partition(':')
+                        panel, hue = panel.strip(), hue.strip().lstrip('#').lower()
+                        if panel in phue and re.fullmatch(r'[0-9a-f]{6}', hue):
+                            phue[panel] = hue
     except OSError:
         pass
-    return state, scale
+    # A scale needs one more colour than it has stops. If the two do
+    # not line up, the pair is unusable - fall back rather than draw
+    # something arbitrary.
+    if len(thue) != len(tstop) + 1:
+        phue  = dict(PANEL_HUES_DEFAULT)
+    tstop, thue = list(TEMP_STOPS_DEFAULT), list(TEMP_HUES_DEFAULT)
+    if len(dhue) != len(dstop) + 1:
+        dstop, dhue = list(DEW_STOPS_DEFAULT), list(DEW_HUES_DEFAULT)
+    scales = {'temp': (tstop, thue), 'dew': (dstop, dhue)}
+    return state, scale, sup, usc, pos, umin, tint, scales, phue
 
 
 # ---- square dials ---------------------------------------------------
@@ -226,13 +311,14 @@ def dials_patch(m):
 
 
 # ---- UDP observation length -----------------------------------------
-UDP_PAIRS = [("""        if bool(int(config['System']['nc_rain'])):
+UDP_STOCK = """        if bool(int(config['System']['nc_rain'])):
             self.device_obs['minuteRain'] = [latest_ob[19], 'mm']
             self.device_obs['dailyRain']  = [latest_ob[20], 'mm']
         else:
             self.device_obs['minuteRain'] = [latest_ob[12], 'mm']
             self.device_obs['dailyRain']  = [latest_ob[18], 'mm']
-""", """        # UDP obs_st carries 18 fields (0-17). Indices 18-21 exist
+"""
+UDP_PATCHED = """        # UDP obs_st carries 18 fields (0-17). Indices 18-21 exist
         # only in the Websocket/REST form of this message, so reading
         # them raised IndexError on every UDP observation and killed
         # the parser thread. Over UDP, rain_accumulation() builds
@@ -246,7 +332,45 @@ UDP_PAIRS = [("""        if bool(int(config['System']['nc_rain'])):
         else:
             self.device_obs['minuteRain'] = [_field(12), 'mm']
             self.device_obs['dailyRain']  = [_field(18), 'mm']
-""")]
+"""
+
+# Match the patch by its CODE, letting the comment above it say
+# anything. Earlier versions of this script worded that comment
+# differently, and an exact-text check would call those files
+# unpatched, then fail to find the stock code to patch - reporting a
+# spurious "PiConsole's code has changed upstream". Matching the code
+# recognises them, and the rewrite normalises the wording.
+UDP_ANY = re.compile(
+    r"(?:^ {8}#.*\n)*"
+    r" {8}def _field\(index\):\n"
+    r" {12}return latest_ob\[index\] if index < len\(latest_ob\) else None\n"
+    r"\n"
+    r" {8}if bool\(int\(config\['System'\]\['nc_rain'\]\)\):\n"
+    r" {12}self\.device_obs\['minuteRain'\] = \[_field\(19\), 'mm'\]\n"
+    r" {12}self\.device_obs\['dailyRain'\]  = \[_field\(20\), 'mm'\]\n"
+    r" {8}else:\n"
+    r" {12}self\.device_obs\['minuteRain'\] = \[_field\(12\), 'mm'\]\n"
+    r" {12}self\.device_obs\['dailyRain'\]  = \[_field\(18\), 'mm'\]\n",
+    re.M)
+
+
+def udp_patch():
+    def forward(text):
+        if UDP_STOCK in text:
+            return text.replace(UDP_STOCK, UDP_PATCHED), text.count(UDP_STOCK)
+        new_text, count = UDP_ANY.subn(lambda m: UDP_PATCHED, text)
+        return new_text, count
+
+    def backward(text):
+        return UDP_ANY.subn(lambda m: UDP_STOCK, text)
+
+    def applied(text):
+        return UDP_PATCHED in text
+
+    def present(text):
+        return bool(UDP_ANY.search(text))
+
+    return forward, backward, applied, present
 
 
 # ---- Sager METAR clouds ---------------------------------------------
@@ -333,6 +457,93 @@ WHOLE_DEG_PAIRS = [("""                    elif round(cObs[ii - 1], 1) == 0.0:
 # and the only fine height adjustment: raise it to lift the decimal.
 DEC_SCALE_DEFAULT = 0.65
 
+# Draw the unit small and raised, the way the WS-2902 does, using
+# Kivy's [sup] - the one place that tag is the right tool, since it
+# positions at the top of the line rather than on the baseline.
+# Applied to all eight fields. On the min/max ones the unit closes
+# its own [size] inside [sup], so the tail needs one [/size] fewer
+# than upstream's - Kivy pops font_size per tag and the count has to
+# come out even, or the rest of the label inherits the wrong size.
+DEC_SUP_DEFAULT = True
+
+# Where the decimal sits. Kivy offers three positions and no pixel
+# offset between them:
+#   baseline  [sub] - bottom aligned with the digits, as the WS-2902
+#                     draws it
+#   normal          - the renderer's own placement for a smaller span,
+#                     (line_height - word_height) / 1.25, which floats
+#                     it between the middle and the bottom
+#   raised    [sup] - top aligned, a true superscript
+# [sub] and [sup] also halve the size on their own; the explicit
+# [size] nested inside overrides that, so position and size stay
+# independent.
+DEC_POS_DEFAULT = 'normal'
+DEC_POS_TAGS = {'baseline': ('sub', '/sub'),
+                'raised':   ('sup', '/sup'),
+                'normal':   (None, None)}
+
+# How big the raised unit is drawn, as a fraction of the field's font
+# size. [sup] on its own halves it; nesting an explicit [size] inside
+# keeps the raised position and lets us pick the size instead.
+DEC_UNIT_SCALE_DEFAULT = 0.45
+
+# Smallest the unit is allowed to get, in pixels. The min/max fields
+# already render at 0.88, so the same fraction that gives a good size
+# on the big reading lands around 5px there. This stops it vanishing
+# without overriding the proportion by much.
+DEC_UNIT_MIN_DEFAULT = 6
+
+# Tint each temperature by its own value. The anchors are the two
+# accents the console already uses - 00a4b4 for a daily minimum,
+# f05e40 for a maximum - with the ordinary text grey in the middle,
+# so a mild reading looks exactly as it does now and only the ends of
+# the range pick up colour. Stops are in DISPLAYED units, which for
+# this build is Fahrenheit.
+TEMP_COLOUR_DEFAULT = True
+TEMP_STOPS_DEFAULT  = [45, 60, 78, 90]
+TEMP_HUES_DEFAULT   = ['00a4b4', '4fc3d7', 'c8c8c8', 'f0a050', 'f05e40']
+
+# Dew point says more about comfort than humidity does, so it gets
+# its own scale: dry, unremarkable, humid, oppressive.
+DEW_STOPS_DEFAULT = [55, 65, 70]
+DEW_HUES_DEFAULT  = ['81c784', 'c8c8c8', 'f0a050', 'f05e40']
+
+# Which scale each field is tinted by. The min/max fields are left
+# out: they already use colour to say which is which.
+TINT_SCALE = {'inTemp': 'temp', 'outTemp': 'temp',
+              'FeelsLike': 'temp', 'DewPoint': 'dew'}
+
+
+def parse_stops(value, fallback):
+    try:
+        out = [float(x) for x in value.split(',') if x.strip()]
+    except ValueError:
+        return fallback
+    return out or fallback
+
+
+def parse_hues(value, fallback):
+    out = [x.strip().lstrip('#').lower() for x in value.split(',') if x.strip()]
+    if all(re.fullmatch(r'[0-9a-f]{6}', x) for x in out) and out:
+        return out
+    return fallback
+
+
+def colour_expr(key, stops, hues):
+    """A .kv expression yielding '[color=xxxxxx]' for this field.
+
+    The value arrives as the formatted string, so it is checked before
+    float() sees it: '-' is what the console shows when a sensor is
+    down, and a negative reading has to survive the test.
+    """
+    val = "float(app.CurrentConditions.Obs['%s'][0])" % key
+    numeric = ("app.CurrentConditions.Obs['%s'][0].lstrip('-')"
+               ".replace('.', '', 1).isdigit()" % key)
+    chain = ''.join("'%s' if %s < %s else " % (hue, val, stop)
+                    for stop, hue in zip(stops, hues))
+    chain += "'%s'" % hues[-1]
+    return ("'[color=' + ((%s) if %s else 'c8c8c8') + ']'" % (chain, numeric))
+
 # Fields whose text rule is a plain value + unit.
 DEC_SIMPLE = ['inTemp', 'outTemp', 'FeelsLike', 'DewPoint']
 
@@ -352,45 +563,76 @@ def dec_marker(key):
     return "Obs['%s'][0].split('.')[0]" % key
 
 
-def dec_targets(scale):
+def dec_targets(scale, sup, unit_scale, pos, unit_min, tint, scales):
     """(stock line, patched line, marker) for every field we touch."""
+    open_tag, close_tag = DEC_POS_TAGS.get(pos, (None, None))
+    # Fragments of the .kv expression, written out in full rather than
+    # assembled by slicing - an earlier version lost a bracket that way.
+    dec_pre  = "'[%s][size='" % open_tag if open_tag else "'[size='"
+    dec_post = "'[/size][/%s]'" % open_tag if open_tag else "'[/size]'"
+    if sup:
+        unit_pre  = "'[sup][size='"
+        unit_post = "'[/size][/sup]'"
     out = []
     for key in DEC_SIMPLE:
         stock = ("        text: app.CurrentConditions.Obs['%s'][0]"
                  " + app.CurrentConditions.Obs['%s'][1]" % (key, key))
-        patched = ("        text: app.CurrentConditions.Obs['%s'][0].split('.')[0]"
-                   " + '[size=' + str(int(self.font_size*%s)) + ']'"
-                   " + ('.' + app.CurrentConditions.Obs['%s'][0].split('.')[1]"
-                   " if '.' in app.CurrentConditions.Obs['%s'][0] else '')"
-                   " + '[/size]' + app.CurrentConditions.Obs['%s'][1]"
-                   % (key, scale, key, key, key))
-        out.append((stock, patched, dec_marker(key)))
+        frac = ("app.CurrentConditions.Obs['%s'][0].split('.')[0]"
+                " + %s + str(int(self.font_size*%s)) + ']'"
+                " + ('.' + app.CurrentConditions.Obs['%s'][0].split('.')[1]"
+                " if '.' in app.CurrentConditions.Obs['%s'][0] else '')"
+                " + %s" % (key, dec_pre, scale, key, key, dec_post))
+        if sup:
+            unit = ("%s + str(int(self.font_size*%s)) + ']'"
+                    " + app.CurrentConditions.Obs['%s'][1] + %s"
+                    % (unit_pre, unit_scale, key, unit_post))
+        else:
+            unit = "app.CurrentConditions.Obs['%s'][1]" % key
+        if tint and key in TINT_SCALE:
+            stops, hues = scales[TINT_SCALE[key]]
+            body = ("%s + %s + %s + '[/color]'"
+                    % (colour_expr(key, stops, hues), frac, unit))
+        else:
+            body = "%s + %s" % (frac, unit)
+        out.append((stock, "        text: " + body, dec_marker(key)))
     for key, colour in DEC_MINMAX:
         stock = ("        text: '[size=' + str(int(self.font_size*0.88)) + '][color=%s]'"
                  " + app.CurrentConditions.Obs['%s'][0]"
                  " + '[size=' + str(int(self.font_size*0.83)) + ']'"
                  " + app.CurrentConditions.Obs['%s'][1] + '[/color][/size][/size]'"
                  % (colour, key, key))
-        patched = ("        text: '[size=' + str(int(self.font_size*0.88)) + '][color=%s]'"
-                   " + app.CurrentConditions.Obs['%s'][0].split('.')[0]"
-                   " + '[size=' + str(int(self.font_size*0.88*%s)) + ']'"
-                   " + ('.' + app.CurrentConditions.Obs['%s'][0].split('.')[1]"
-                   " if '.' in app.CurrentConditions.Obs['%s'][0] else '')"
-                   " + '[/size]' + '[size=' + str(int(self.font_size*0.83)) + ']'"
-                   " + app.CurrentConditions.Obs['%s'][1] + '[/color][/size][/size]'"
-                   % (colour, key, scale, key, key, key))
-        out.append((stock, patched, dec_marker(key)))
+        frac = ("'[size=' + str(int(self.font_size*0.88)) + '][color=%s]'"
+                " + app.CurrentConditions.Obs['%s'][0].split('.')[0]"
+                " + %s + str(int(self.font_size*0.88*%s)) + ']'"
+                " + ('.' + app.CurrentConditions.Obs['%s'][0].split('.')[1]"
+                " if '.' in app.CurrentConditions.Obs['%s'][0] else '')"
+                " + %s" % (colour, key, dec_pre, scale, key, key, dec_post))
+        if sup:
+            # The unit closes its own [size] inside [sup], so the tail
+            # carries one [/size] fewer than upstream's. Kivy pops
+            # font_size once per closing tag: three pushes here (field,
+            # decimal, unit) need exactly three pops, and [sub]/[sup]
+            # balance their own.
+            unit = ("%s + str(max(int(self.font_size*0.88*%s), %s)) + ']'"
+                    " + app.CurrentConditions.Obs['%s'][1]"
+                    " + %s + '[/color][/size]'"
+                    % (unit_pre, unit_scale, unit_min, key, unit_post))
+        else:
+            unit = ("'[size=' + str(int(self.font_size*0.83)) + ']'"
+                    " + app.CurrentConditions.Obs['%s'][1] + '[/color][/size][/size]'"
+                    % key)
+        out.append((stock, "        text: %s + %s" % (frac, unit), dec_marker(key)))
     return out
 
 
-def decimal_patch(scale):
+def decimal_patch(scale, sup, unit_scale, pos, unit_min, tint, scales):
     """Forward, reverse and 'is it applied' for the decimal-size patch.
 
     Line based rather than a literal swap, so that changing the scale
     re-writes a line already patched at the old value instead of
     reporting 'already applied' and doing nothing.
     """
-    targets = dec_targets(scale)
+    targets = dec_targets(scale, sup, unit_scale, pos, unit_min, tint, scales)
 
     def rewrite(text, pick):
         lines = text.split('\n')
@@ -421,6 +663,151 @@ def decimal_patch(scale):
         return all(marker in text for _, _, marker in targets)
 
     return forward, backward, applied, present
+
+
+# ---- peak sun hours precision ---------------------------------------
+# Two decimals on a figure in hours is more precision than the number
+# carries. The 'hrs' test keeps this away from the identical battery
+# voltage line, where two decimals across 2.4-2.8 V is right.
+PEAK_SUN_PAIRS = [("""                if isinstance(psh, str) and psh.strip() == 'hrs':
+                    if cObs[ii - 1] is None:
+                        cObs[ii - 1] = '-'
+                    else:
+                        cObs[ii - 1] = '{:.2f}'.format(cObs[ii - 1])
+""", """                if isinstance(psh, str) and psh.strip() == 'hrs':
+                    if cObs[ii - 1] is None:
+                        cObs[ii - 1] = '-'
+                    else:
+                        cObs[ii - 1] = '{:.1f}'.format(cObs[ii - 1])
+""")]
+
+
+# ---- panel accent colours -------------------------------------------
+# Each panel's heading is drawn white by PanelTitle. Colouring them
+# per panel is what gives the WS-2902 its liveliness. PanelTitle
+# inherits markup from DisplayField, so wrapping the title string is
+# enough - no widget changes.
+#
+# The set is chosen to read as one system rather than as confetti:
+# similar saturation and lightness throughout, each one legible on
+# black, and where a panel has an obvious colour it gets it (gold for
+# solar, cyan for rain).
+PANEL_HUES_DEFAULT = {
+    'Forecast':    '8ab4f8',
+    'Temperature': 'f0a050',
+    'Wind Speed':  '9ccc65',
+    'Rainfall':    '4fc3d7',
+    'Barometer':   'b39ddb',
+    'Moon':        'b0bec5',
+    'Lightning':   'ff8a65',
+    'Sager':       '80cbc4',
+    'Solar':       'ffca28',
+}
+
+# Which file each title lives in, and the exact stock line. Solar is
+# the odd one out - its title already carries [size] markup for the
+# divider between "Solar" and "UV".
+PANEL_FILES = {
+    'Forecast':    ('kvlang/forecast.kv',    "        _panelTitle: 'Forecast'"),
+    'Temperature': ('kvlang/temperature.kv', "        _panelTitle: 'Temperature'"),
+    'Wind Speed':  ('kvlang/wind.kv',        "        _panelTitle: 'Wind Speed'"),
+    'Rainfall':    ('kvlang/rainfall.kv',    "        _panelTitle: 'Rainfall'"),
+    'Barometer':   ('kvlang/barometer.kv',   "        _panelTitle: 'Barometer'"),
+    'Moon':        ('kvlang/astro.kv',       "        _panelTitle: 'Moon'"),
+    'Lightning':   ('kvlang/lightning.kv',   "        _panelTitle: 'Lightning'"),
+    'Sager':       ('kvlang/forecast.kv',    "        _panelTitle: 'Sager'"),
+    'Solar':       ('kvlang/astro.kv',
+                    "        _panelTitle: 'Solar  [size=' + str(int(self.ids.Title.font_size*0.8))"
+                    " + ']|[/size]  UV'"),
+}
+
+
+def panel_pairs(hues):
+    """(path, stock line, patched line) for every panel title."""
+    out = []
+    for name, (path, stock) in sorted(PANEL_FILES.items()):
+        hue = hues.get(name)
+        if not hue:
+            continue
+        body = stock.split('_panelTitle: ', 1)[1]
+        patched = "        _panelTitle: '[color=%s]' + %s + '[/color]'" % (hue, body)
+        out.append((path, stock, patched))
+    return out
+
+
+PANEL_MARK = "        _panelTitle: '[color="
+
+
+def panel_patch(hues):
+    """Forward, reverse and state checks for the panel title colours.
+
+    Line based, and a patched line is recognised by its marker plus
+    the original title text rather than by an exact match, so that
+    changing a colour rewrites the line instead of being read as
+    "already applied".
+    """
+    pairs = panel_pairs(hues)
+    paths = sorted({path for path, _, _ in pairs})
+
+    def rewrite(text, path, pick):
+        lines = text.split('\n')
+        count = 0
+        for i, line in enumerate(lines):
+            for target, stock, patched in pairs:
+                if target != path:
+                    continue
+                body = stock.split('_panelTitle: ', 1)[1]
+                if line == stock or (line.startswith(PANEL_MARK) and body in line):
+                    want = pick(stock, patched)
+                    if line != want:
+                        lines[i] = want
+                        count += 1
+                    break
+        return '\n'.join(lines), count
+
+    def forward(text, path):
+        return rewrite(text, path, lambda stock, patched: patched)
+
+    def backward(text, path):
+        return rewrite(text, path, lambda stock, patched: stock)
+
+    def applied(text, path):
+        return all(patched in text for target, _, patched in pairs if target == path)
+
+    def present(text, path):
+        return any(line.startswith(PANEL_MARK) for line in text.split('\n'))
+
+    return paths, forward, backward, applied, present
+
+
+def run_panels(name, paths, forward, backward, applied, present, want):
+    """Apply or revert a patch that spans several files."""
+    results = []
+    for rel in paths:
+        path = os.path.join(ROOT, rel)
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError as err:
+            results.append('cannot read %s: %s' % (rel, err))
+            continue
+        if want:
+            if applied(text, rel):
+                continue
+            new_text, count = forward(text, rel)
+        else:
+            if not present(text, rel):
+                continue
+            new_text, count = backward(text, rel)
+        if count:
+            with open(path, 'w') as f:
+                f.write(new_text)
+            results.append('%s (%d)' % (rel.split('/')[-1], count))
+    if not want:
+        return '%s: off%s' % (name, ' - reverted ' + ', '.join(results) if results else '')
+    if not results:
+        return '%s: already applied' % name
+    return '%s: applied %s' % (name, ', '.join(results))
 
 
 def text_patch(pairs):
@@ -482,7 +869,8 @@ def run(name, relpath, forward, backward, applied, present, want):
     return f"{name}: reverted ({count})"
 
 
-want, dec_scale = settings()
+(want, dec_scale, dec_sup, dec_unit, dec_pos, dec_umin,
+ dec_tint, dec_scales, panel_hues) = settings()
 status = [
     run('square-dials', os.path.join('kvlang', 'layout.kv'),
         lambda t: DIALS_ORIGINAL.subn(dials_patch, t),
@@ -491,7 +879,7 @@ status = [
         lambda t: bool(DIALS_DONE.search(t)),
         want['square-dials']),
     run('udp-obs-length', os.path.join('lib', 'observation_parser.py'),
-        *text_patch(UDP_PAIRS), want['udp-obs-length']),
+        *udp_patch(), want['udp-obs-length']),
     run('sager-metar-clouds', os.path.join('lib', 'sager.py'),
         *text_patch(SAGER_PAIRS), want['sager-metar-clouds']),
     run('pressure-precision', os.path.join('lib', 'observation_format.py'),
@@ -499,7 +887,12 @@ status = [
     run('temp-whole-degrees', os.path.join('lib', 'observation_format.py'),
         *text_patch(WHOLE_DEG_PAIRS), want['temp-whole-degrees']),
     run('temp-decimal-size', os.path.join('kvlang', 'temperature.kv'),
-        *decimal_patch(dec_scale), want['temp-decimal-size']),
+        *decimal_patch(dec_scale, dec_sup, dec_unit, dec_pos, dec_umin,
+                       dec_tint, dec_scales),
+        want['temp-decimal-size']),
+    run('peak-sun-precision', os.path.join('lib', 'observation_format.py'),
+        *text_patch(PEAK_SUN_PAIRS), want['peak-sun-precision']),
+    run_panels('panel-accents', *panel_patch(panel_hues), want['panel-accents']),
 ]
 for line in status:
     print(line)
@@ -539,6 +932,30 @@ temp-decimal-size  = on
 # reads too low, lower it if it reads too heavy. Allowed 0.3 to 1.0;
 # re-run the script after changing it.
 temp-decimal-scale = 0.65
+
+# Where the decimal sits. Kivy offers three positions and nothing
+# between them:
+#   baseline  bottom aligned with the digits, as the WS-2902 draws it
+#   normal    the renderer's own placement, floating between middle
+#             and bottom
+#   raised    a true superscript, top aligned
+temp-decimal-position = normal
+
+# Draw the unit small and raised, the way the WS-2902 does, on the
+# outdoor, indoor, Feels Like and Dew Point readings. Off leaves it
+# full size on the baseline, as upstream has it.
+temp-unit-superscript = on
+
+# How big that raised unit is, as a fraction of the digits beside it.
+# [sup] alone would give 0.5. Allowed 0.2 to 1.0.
+temp-unit-scale = 0.45
+
+# Smallest the unit may get, in pixels. Only bites on the min/max
+# fields, whose digits are already reduced.
+temp-unit-min-px = 6
+
+# Peak Sun Hours to one decimal instead of two.
+peak-sun-precision = on
 EOF
 fi
 
