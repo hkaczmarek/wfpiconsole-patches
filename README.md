@@ -1,6 +1,6 @@
 # WeatherFlow PiConsole patches
 
-Four patches for the [WeatherFlow
+Patches for the [WeatherFlow
 PiConsole](https://github.com/peted-davis/WeatherFlow_PiConsole),
 plus the machinery to keep them applied across updates.
 
@@ -8,8 +8,11 @@ The first three are bugs in the console rather than configuration
 problems. One makes every circular gauge draw as an oval; one makes
 a station in UDP mode display wind and nothing else; one makes the
 Sager forecaster fail on clear days, which is to say most days
-here. The fourth is a matter of taste, and drops two readings to
+here. The rest are matters of taste, and bring two readings down to
 the precision the instrument can actually support.
+
+Every patch can be switched on or off, and switching one off
+**reverts** it rather than merely leaving it applied.
 
 Tested against v26.4.2 on a Raspberry Pi 4 running 64-bit
 Raspberry Pi OS Trixie, driving a 10.1 inch 1280x800 panel.
@@ -27,10 +30,29 @@ where it needs to. It installs:
 
 ```
 /usr/local/bin/wfpiconsole-patches       the fixes, idempotent
+/etc/wfpiconsole-patches.conf            on/off for each patch
 wfpiconsole-patches.path / .service      re-run them when PiConsole's
                                          files change, i.e. after an update
 wfpiconsole.service.d/patches.conf       re-run them before every autostart
 ```
+
+## Turning one off
+
+Edit `/etc/wfpiconsole-patches.conf`, set the patch to `off`, and
+run the script once:
+
+```
+sudo wfpiconsole-patches ~/wfpiconsole
+```
+
+It reverts a patch you switch off, restoring that part of the file
+exactly - not just stopping at the next update. The config file is
+written on first install and never overwritten afterwards, so your
+choices survive both updates and re-runs of the installer.
+
+The one exception is `square-dials`, which rewrites three blocks
+with a regex and has no automatic reverse. Turning it off stops it
+being re-applied; `wfpiconsole update` restores the stock layout.
 
 Nothing is placed inside `~/wfpiconsole`, so `wfpiconsole update`
 cannot remove any of it. The patch script only rewrites a file it
@@ -205,40 +227,84 @@ field - is not reporting at all.
 
 ## 4. Decimals the sensor cannot support
 
-Not a bug - a preference, and the one patch here you might not
-want. `lib/observation_format.py` hardcodes the precision of every
-reading. Two of them claim more than the Tempest can measure.
+Not bugs - preferences, and the patches here you are most likely to
+want to change. The console hardcodes the precision of every
+reading, and two of them claim more than the Tempest can measure.
 
-**Temperature** prints as `72.1℉`. The Tempest is spec'd at ±0.3 °C,
-which is ±0.5 °F, so that tenth is noise wearing the costume of
-precision. Whole degrees.
+### pressure-precision
 
-**Pressure** prints as `29.921 inHg` - a resolution of about 0.03
-hPa against a ±1 hPa sensor. Two decimals, which is how an
-altimeter setting is read everywhere else anyway.
+Pressure prints as `29.921 inHg` - a resolution of about 0.03 hPa
+against a ±1 hPa sensor, and one decimal more than an altimeter
+setting is read in anywhere else. Two decimals.
 
-Both rate-of-change figures keep their decimals. A trend of a few
-tenths of a degree, or a few thousandths of an inch, per hour *is*
-the signal; rounding it would flatten it to zero.
+The hourly trend keeps all three: a few thousandths of an inch per
+hour *is* the whole signal there.
 
-Before and after, through the console's own formatter:
+### Temperature: two answers, pick one
+
+Temperature prints as `72.1℉`. The Tempest is spec'd at ±0.3 °C,
+which is ±0.5 °F, so the tenth is below what the instrument can
+resolve. There are two ways to deal with that, and they conflict -
+a rounded value has no decimal left to shrink - so exactly one
+should be on.
+
+**`temp-whole-degrees`** (off by default) rounds it away in
+`lib/observation_format.py`: `72.1℉` becomes `72℉`.
+
+**`temp-decimal-size`** (on by default) keeps the tenth and draws it
+smaller, so it stops competing with the number you actually read:
 
 ```
-temperature                    72.1℉  ->        72℉
-temperature trend           +1.4℉/hr  ->  +1.4℉/hr
-pressure                 29.921 inHg  ->  29.92 inHg
-pressure trend         0.014 inHg/hr  ->  0.014 inHg/hr
+72.1℉   ->   72.1℉        with the .1 drawn at 65% size
 ```
 
-Everything else was already right and is left alone: humidity,
-solar radiation and wind direction are integers; rain is two
-decimals in inches, the standard reporting increment; battery is
-two decimals across a 2.4-2.8 V range; wind drops to integers above
-10 mph. If you want the forecast to match, note it already uses
-whole degrees - `forecastTemp` has always been `.0f`.
+This is how the Ambient Weather WS-2902 console shows it, and it is
+the better answer: no information is thrown away, but the display
+reads as cleanly as if it had been. It is a `kvlang/temperature.kv`
+change rather than a Python one - PiConsole already uses Kivy
+`[size=…]` markup to shrink the unit on the min/max fields, and
+`LargeField` inherits `markup` from `DisplayField`, so the
+machinery was already there.
 
-Skip this patch by deleting its entry from the `status` list in
-the installer.
+It has to be done per field, because Kivy's `[size=]` takes an
+absolute number and only the `.kv` knows each field's
+`self.font_size`. Doing it once in `observation_format.py` is not
+possible. So it covers every value in the temperature panel that
+can carry a decimal — the large indoor and outdoor readings, Feels
+Like, Dew Point, and all four min/max fields — but not the 24-hour
+difference or the trend, which are rates, already drawn small, and
+where the decimal *is* the signal.
+
+Handled along the way: the value is `-` when a sensor is down, and
+negative temperatures split correctly (`-3.2` into `-3` and `.2`).
+The min/max fields already render at 0.88 of their font size, so
+their decimal is scaled against that rather than against the raw
+size.
+
+### Size and height are the same dial
+
+`temp-decimal-scale` in the conf file sets how big the decimal is
+drawn, and that also sets how high it sits.
+
+Kivy gives inline text exactly three vertical positions —
+superscript, normal, subscript — and no pixel offset. On normal
+positioning the renderer places each span at
+`(line_height - word_height) / 1.25`, so a *larger* span sits
+*higher*. Raise the scale if the decimal reads too low, lower it if
+it reads too heavy. 0.65 is the default; the range accepted is 0.3
+to 1.0.
+
+Changing it and re-running the script rewrites the lines in place —
+the script checks for the scale it was asked for, not merely for
+"some decimal patch is present".
+
+### What was already right
+
+Left alone: humidity, solar radiation and wind direction are
+integers; rain is two decimals in inches, the standard reporting
+increment; battery is two decimals across a 2.4-2.8 V range; wind
+drops to integers above 10 mph. The forecast high and low have
+always used whole degrees - `forecastTemp` is `.0f` upstream.
 
 ---
 
